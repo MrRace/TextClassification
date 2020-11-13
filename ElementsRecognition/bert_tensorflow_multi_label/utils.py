@@ -96,6 +96,19 @@ def create_examples(df, labels_available=True, dt_format="csv", tag_dic=""):
     return examples
 
 
+def create_examples_text_list(text_list):
+    """Creates examples for the training and dev sets.
+    方便请求方调用
+    """
+    examples = []
+    labels = 20 * [0]
+    for (i, row) in enumerate(text_list):
+        guid = i
+        text_a = row
+        examples.append(InputExample(guid=guid, text_a=text_a, labels=labels))
+    return examples
+
+
 class PaddingInputExample(object):
     """Fake example so the num input examples is a multiple of the batch size.
     When running eval/predict on the TPU, we need to pad the number of examples
@@ -507,6 +520,118 @@ def input_fn_builder(features, seq_length, is_training, drop_remainder):
     return d
 
   return input_fn
+
+
+def text_based_input_fn_builder(text_list, seq_length, tokenizer, input_file,
+                                drop_remainder):
+    """Creates an `input_fn` closure to be passed to serving."""
+    predict_examples = create_examples_text_list(text_list)
+    for (ex_index, example) in enumerate(predict_examples):
+        feature = convert_single_example(ex_index, example,
+                                         cfig.max_seq_length, tokenizer)
+
+        def create_int_feature(values):
+            f = tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
+            return f
+
+        features = collections.OrderedDict()
+        features["input_ids"] = create_int_feature(feature.input_ids)
+        features["input_mask"] = create_int_feature(feature.input_mask)
+        features["segment_ids"] = create_int_feature(feature.segment_ids)
+        features["is_real_example"] = create_int_feature(
+            [int(feature.is_real_example)])
+        if isinstance(feature.label_ids, list):
+            label_ids = feature.label_ids
+        else:
+            label_ids = feature.label_ids[0]
+        features["label_ids"] = create_int_feature(label_ids)
+
+        tf_example = tf.train.Example(features=tf.train.Features(feature=features))
+
+    name_to_features = {
+        "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
+        "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
+        "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
+        "label_ids": tf.FixedLenFeature([20], tf.int64),
+        "is_real_example": tf.FixedLenFeature([], tf.int64),
+    }
+
+    def _decode_record(record, name_to_features):
+        """Decodes a record to a TensorFlow example."""
+        example = tf.parse_single_example(record, name_to_features)
+
+        # tf.Example only supports tf.int64, but the TPU only supports tf.int32.
+        # So cast all int64 to int32.
+        for name in list(example.keys()):
+            t = example[name]
+            if t.dtype == tf.int64:
+                t = tf.to_int32(t)
+            example[name] = t
+
+        return example
+
+    def input_fn(params):
+        """The actual input function."""
+        batch_size = params["batch_size"]
+
+        # For training, we want a lot of parallel reading and shuffling.
+        # For eval, we want no shuffling and parallel reading doesn't matter.
+        d = tf.data.TFRecordDataset(input_file)
+        d = d.apply(
+            tf.contrib.data.map_and_batch(
+                lambda record: _decode_record(record, name_to_features),
+                batch_size=batch_size,
+                drop_remainder=drop_remainder))
+
+        return d
+
+    return input_fn
+
+
+def serving_input_receiver_fn():
+    feature_spec = {
+        "label_ids": tf.FixedLenFeature([], tf.int64),
+        "input_ids": tf.FixedLenFeature([cfig.max_seq_length], tf.int64),
+        "input_mask": tf.FixedLenFeature([cfig.max_seq_length], tf.int64),
+        "segment_ids": tf.FixedLenFeature([cfig.max_seq_length], tf.int64),
+    }
+    serialized_tf_example = tf.placeholder(dtype=tf.string, shape=None,
+                                           name='input_example_tensor')
+
+    receiver_tensors = {'examples': serialized_tf_example}
+    features = tf.parse_example(serialized_tf_example, feature_spec)
+    # tf.Examples
+    return tf.estimator.export.ServingInputReceiver(features, receiver_tensors)
+
+
+def serving_input_fn():
+    # 保存模型为SaveModel格式
+    # 采用最原始的feature方式，输入是feature Tensors。
+    # 如果采用build_parsing_serving_input_receiver_fn，则输入是tf.Examples
+    label_ids = tf.placeholder(tf.int32, [None, 20], name='label_ids')
+    input_ids = tf.placeholder(tf.int32, [None, cfig.max_seq_length], name='input_ids')
+    input_mask = tf.placeholder(tf.int32, [None, cfig.max_seq_length], name='input_mask')
+    segment_ids = tf.placeholder(tf.int32, [None, cfig.max_seq_length], name='segment_ids')
+    input_fn = tf.estimator.export.build_raw_serving_input_receiver_fn({
+        'label_ids': label_ids,
+        'input_ids': input_ids,
+        'input_mask': input_mask,
+        'segment_ids': segment_ids,
+    })()
+    return input_fn
+
+
+def serving_input_fn_v2():
+    # 保存模型为SaveModel格式
+    # 如果采用build_parsing_serving_input_receiver_fn，则输入是tf.Examples
+    feature_spec = {
+        "label_ids": tf.FixedLenFeature([], tf.int64),
+        "input_ids": tf.FixedLenFeature([cfig.max_seq_length], tf.int64),
+        "input_mask": tf.FixedLenFeature([cfig.max_seq_length], tf.int64),
+        "segment_ids": tf.FixedLenFeature([cfig.max_seq_length], tf.int64),
+    }
+    input_fn = tf.estimator.export.build_parsing_serving_input_receiver_fn(feature_spec)()
+    return input_fn
 
 
 def convert_examples_to_features(examples, max_seq_length, tokenizer):
